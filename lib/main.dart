@@ -1,33 +1,16 @@
-import 'dart:convert';
-
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
+import 'auth_gate.dart';
+import 'candidate.dart';
 import 'weather.dart';
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
   runApp(const ClassElectionApp());
-}
-
-// MODEL: describes one candidate.
-class Candidate {
-  Candidate({required this.name, this.votes = 0});
-
-  final String name;
-  int votes;
-
-  // Candidate -> Map (to save it).
-  Map<String, dynamic> toJson() {
-    return {'name': name, 'votes': votes};
-  }
-
-  // Map -> Candidate (to load it).
-  factory Candidate.fromJson(Map<String, dynamic> json) {
-    return Candidate(
-      name: json['name'] as String,
-      votes: json['votes'] as int,
-    );
-  }
 }
 
 class ClassElectionApp extends StatelessWidget {
@@ -127,7 +110,8 @@ class ClassElectionApp extends StatelessWidget {
         ),
       ),
 
-      home: const ElectionHome(),
+      // The gate decides: login screen or the election.
+      home: const AuthGate(),
     );
   }
 }
@@ -143,64 +127,21 @@ class _ElectionHomeState extends State<ElectionHome> {
   final voterController = TextEditingController();
   final candidateController = TextEditingController();
 
-  final List<Candidate> candidates = [
-    Candidate(name: 'Keza'),
-    Candidate(name: 'Mutoni'),
-    Candidate(name: 'Gisa'),
-  ];
-
-  // Normalized voter name -> candidate name.
-  final Map<String, String> votesByVoter = {};
-
   int selectedScreen = 0;
+
+  // The candidates now live in Firestore. The screen listens to them.
+  late final Stream<QuerySnapshot<Map<String, dynamic>>> candidatesStream =
+  myCandidates().orderBy('name').snapshots();
 
   // WEATHER (live data from the API): three states.
   Weather? weather;
   bool weatherLoading = true;
   String? weatherError;
 
-  int get totalVotes => votesByVoter.length;
-
   @override
   void initState() {
     super.initState();
-    loadData();
     loadWeather();
-  }
-
-  // SAVE EVERYTHING ON THE PHONE.
-  Future<void> saveData() async {
-    final prefs = await SharedPreferences.getInstance();
-    final list = candidates.map((c) => c.toJson()).toList();
-    await prefs.setString('candidates', jsonEncode(list));
-    await prefs.setString('voters', jsonEncode(votesByVoter));
-  }
-
-  // LOAD EVERYTHING WHEN THE APP OPENS.
-  Future<void> loadData() async {
-    final prefs = await SharedPreferences.getInstance();
-    final savedCandidates = prefs.getString('candidates');
-    final savedVoters = prefs.getString('voters');
-
-    // First time ever: nothing saved, keep the sample candidates.
-    if (savedCandidates == null) return;
-    if (!mounted) return;
-
-    final list = jsonDecode(savedCandidates) as List;
-    final voters = savedVoters == null
-        ? <String, dynamic>{}
-        : jsonDecode(savedVoters) as Map<String, dynamic>;
-
-    setState(() {
-      candidates
-        ..clear()
-        ..addAll(
-          list.map((x) => Candidate.fromJson(x as Map<String, dynamic>)),
-        );
-      votesByVoter
-        ..clear()
-        ..addAll(voters.map((key, value) => MapEntry(key, value as String)));
-    });
   }
 
   // LOAD THE WEATHER FROM THE SERVER.
@@ -227,6 +168,11 @@ class _ElectionHomeState extends State<ElectionHome> {
     }
   }
 
+  // COMPUTED, NEVER SAVED: total votes.
+  int totalVotesOf(List<Candidate> candidates) {
+    return candidates.fold<int>(0, (sum, c) => sum + c.votes);
+  }
+
   // CLEAN AND FORMAT NAMES.
   String cleanName(String input) {
     final trimmed = input.trim();
@@ -243,7 +189,9 @@ class _ElectionHomeState extends State<ElectionHome> {
     }).join(' ');
   }
 
-  String voterKey(String name) => cleanName(name).toLowerCase();
+  // The voter's document id. A "/" is not allowed in a document id.
+  String voterKey(String name) =>
+      cleanName(name).toLowerCase().replaceAll('/', '-');
 
   // SHOW A MESSAGE.
   void showMessage(String message) {
@@ -333,7 +281,7 @@ class _ElectionHomeState extends State<ElectionHome> {
   }
 
   // RECORD A VOTE.
-  void castVote(Candidate candidate) {
+  Future<void> castVote(Candidate candidate) async {
     final voter = cleanName(voterController.text);
 
     if (voter.isEmpty) {
@@ -341,30 +289,38 @@ class _ElectionHomeState extends State<ElectionHome> {
       return;
     }
 
-    if (!candidates.contains(candidate)) {
-      showMessage('This candidate is not available.');
-      return;
-    }
+    try {
+      final voterDoc = myVoters().doc(voterKey(voter));
 
-    final key = voterKey(voter);
+      // Has this voter already voted?
+      final existing = await voterDoc.get();
+      if (!mounted) return;
+      if (existing.exists) {
+        showMessage('$voter has already voted.');
+        return;
+      }
 
-    if (votesByVoter.containsKey(key)) {
-      showMessage('$voter has already voted.');
-      return;
-    }
+      // One batch: remember the voter AND add 1 to the candidate.
+      // Both happen, or none.
+      final batch = FirebaseFirestore.instance.batch();
+      batch.set(voterDoc, {'name': voter, 'candidate': candidate.name});
+      batch.update(
+        myCandidates().doc(candidate.id),
+        {'votes': FieldValue.increment(1)},
+      );
+      await batch.commit();
 
-    setState(() {
-      candidate.votes++;
-      votesByVoter[key] = candidate.name;
+      if (!mounted) return;
       voterController.clear();
-    });
-
-    saveData();
-    showVoteSuccess(candidate.name);
+      showVoteSuccess(candidate.name);
+    } catch (e) {
+      if (!mounted) return;
+      showMessage('Could not save your vote. Check your connection.');
+    }
   }
 
   // ADD A CANDIDATE.
-  void addCandidate() {
+  Future<void> addCandidate() async {
     final name = cleanName(candidateController.text);
 
     if (name.isEmpty) {
@@ -372,26 +328,30 @@ class _ElectionHomeState extends State<ElectionHome> {
       return;
     }
 
-    final exists = candidates.any(
-          (candidate) => candidate.name.toLowerCase() == name.toLowerCase(),
-    );
+    try {
+      final duplicate = await myCandidates()
+          .where('name', isEqualTo: name)
+          .limit(1)
+          .get();
+      if (!mounted) return;
 
-    if (exists) {
-      showMessage('$name already exists.');
-      return;
-    }
+      if (duplicate.docs.isNotEmpty) {
+        showMessage('$name already exists.');
+        return;
+      }
 
-    setState(() {
-      candidates.add(Candidate(name: name));
+      await myCandidates().add(Candidate(name: name).toMap());
+      if (!mounted) return;
       candidateController.clear();
-    });
-
-    saveData();
-    showMessage('$name was added.');
+      showMessage('$name was added.');
+    } catch (e) {
+      if (!mounted) return;
+      showMessage('Could not add the candidate. Check your connection.');
+    }
   }
 
   // REMOVE A CANDIDATE WITH ZERO VOTES.
-  void removeCandidate(Candidate candidate) {
+  Future<void> removeCandidate(Candidate candidate) async {
     if (candidate.votes > 0) {
       showMessage(
         'You cannot remove a candidate who has votes.',
@@ -399,12 +359,34 @@ class _ElectionHomeState extends State<ElectionHome> {
       return;
     }
 
-    setState(() {
-      candidates.remove(candidate);
-    });
+    final sure = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Remove this candidate?'),
+        content: Text(candidate.name),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Remove'),
+          ),
+        ],
+      ),
+    );
 
-    saveData();
-    showMessage('${candidate.name} was removed.');
+    if (sure != true || !mounted) return;
+
+    try {
+      await myCandidates().doc(candidate.id).delete();
+      if (!mounted) return;
+      showMessage('${candidate.name} was removed.');
+    } catch (e) {
+      if (!mounted) return;
+      showMessage('Could not remove the candidate.');
+    }
   }
 
   // RESET THE ELECTION.
@@ -429,22 +411,31 @@ class _ElectionHomeState extends State<ElectionHome> {
       ),
     );
 
-    if (confirmed == true && mounted) {
-      setState(() {
-        for (final candidate in candidates) {
-          candidate.votes = 0;
-        }
+    if (confirmed != true || !mounted) return;
 
-        votesByVoter.clear();
-      });
+    try {
+      final voters = await myVoters().get();
+      final candidates = await myCandidates().get();
 
-      saveData();
+      final batch = FirebaseFirestore.instance.batch();
+      for (final doc in voters.docs) {
+        batch.delete(doc.reference);
+      }
+      for (final doc in candidates.docs) {
+        batch.update(doc.reference, {'votes': 0});
+      }
+      await batch.commit();
+
+      if (!mounted) return;
       showMessage('Election has been reset.');
+    } catch (e) {
+      if (!mounted) return;
+      showMessage('Could not reset the election.');
     }
   }
 
   // SELECTION SORT: HIGHEST VOTES FIRST.
-  List<Candidate> rankedCandidates() {
+  List<Candidate> rankedCandidates(List<Candidate> candidates) {
     final remaining = List<Candidate>.of(candidates);
     final ranked = <Candidate>[];
 
@@ -464,8 +455,8 @@ class _ElectionHomeState extends State<ElectionHome> {
   }
 
   // DETERMINE THE ELECTION RESULT.
-  String electionResult() {
-    if (totalVotes == 0) {
+  String electionResult(List<Candidate> candidates) {
+    if (totalVotesOf(candidates) == 0) {
       return 'No votes yet';
     }
 
@@ -510,15 +501,45 @@ class _ElectionHomeState extends State<ElectionHome> {
             onPressed: confirmReset,
             icon: const Icon(Icons.restart_alt),
           ),
+          IconButton(
+            tooltip: 'Log out',
+            onPressed: () => FirebaseAuth.instance.signOut(),
+            icon: const Icon(Icons.logout),
+          ),
         ],
       ),
 
-      body: IndexedStack(
-        index: selectedScreen,
-        children: [
-          buildVoteScreen(),
-          buildResultsScreen(),
-        ],
+      // The list comes from Firestore: loading, error, then data.
+      body: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+        stream: candidatesStream,
+        builder: (context, snapshot) {
+          if (snapshot.hasError) {
+            return Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Text(
+                  'Could not load the election.\n${snapshot.error}',
+                  textAlign: TextAlign.center,
+                ),
+              ),
+            );
+          }
+
+          if (!snapshot.hasData) {
+            return const Center(child: CircularProgressIndicator());
+          }
+
+          final candidates =
+          snapshot.data!.docs.map(Candidate.fromDoc).toList();
+
+          return IndexedStack(
+            index: selectedScreen,
+            children: [
+              buildVoteScreen(candidates),
+              buildResultsScreen(candidates),
+            ],
+          );
+        },
       ),
 
       bottomNavigationBar: NavigationBar(
@@ -593,7 +614,9 @@ class _ElectionHomeState extends State<ElectionHome> {
   }
 
   // VOTING SCREEN.
-  Widget buildVoteScreen() {
+  Widget buildVoteScreen(List<Candidate> candidates) {
+    final totalVotes = totalVotesOf(candidates);
+
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
@@ -662,6 +685,7 @@ class _ElectionHomeState extends State<ElectionHome> {
 
         const SizedBox(height: 8),
 
+        // EMPTY STATE
         if (candidates.isEmpty)
           const Padding(
             padding: EdgeInsets.all(16),
@@ -762,8 +786,9 @@ class _ElectionHomeState extends State<ElectionHome> {
   }
 
   // RESULTS SCREEN.
-  Widget buildResultsScreen() {
-    final ranked = rankedCandidates();
+  Widget buildResultsScreen(List<Candidate> candidates) {
+    final ranked = rankedCandidates(candidates);
+    final totalVotes = totalVotesOf(candidates);
 
     return ListView(
       padding: const EdgeInsets.all(16),
@@ -795,7 +820,7 @@ class _ElectionHomeState extends State<ElectionHome> {
                 const SizedBox(height: 12),
 
                 Text(
-                  electionResult(),
+                  electionResult(candidates),
                   textAlign: TextAlign.center,
                   style: const TextStyle(
                     fontSize: 21,

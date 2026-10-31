@@ -22,3 +22,10 @@ subprojects {
 tasks.register<Delete>("clean") {
     delete(rootProject.layout.buildDirectory)
 }
+plugins {
+    // Keep your existing Android and Kotlin plugins
+
+    id("com.google.gms.google-services")
+
+    // Keep your existing Flutter plugin line
+}
