@@ -1,15 +1,19 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 
 import 'auth_gate.dart';
 import 'candidate.dart';
+import 'firebase_web_options.dart';
 import 'weather.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await Firebase.initializeApp();
+  await Firebase.initializeApp(
+    options: kIsWeb ? firebaseWebOptions : null,
+  );
   runApp(const ClassElectionApp());
 }
 
